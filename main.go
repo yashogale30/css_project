@@ -3,23 +3,23 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/binary"
 	"fmt"
+	"io"
 	"log"
 	"os"
 
 	libp2p "github.com/libp2p/go-libp2p"
+	"github.com/gordonklaus/portaudio"
 	"github.com/libp2p/go-libp2p/core/network"
-	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/multiformats/go-multiaddr"
 )
 
-const protocolID = "/p2p-chat/1.0.0"
+const protocolID = "/p2p-voice/1.0.0"
 
 func main() {
+
 	ctx := context.Background()
 
-	// Create libp2p host
-	// creates crypto pair, secure connection,creates peer id, opens connections (tcp…)
 	host, err := libp2p.New()
 	if err != nil {
 		log.Fatal(err)
@@ -27,77 +27,124 @@ func main() {
 
 	fmt.Println("Peer ID:", host.ID())
 
-	// prints listening addr
-	for _, a := range host.Addrs() {
-		fmt.Printf("Listening on %s/p2p/%s\n", a, host.ID())
+	for _, addr := range host.Addrs() {
+		fmt.Println("Listening on:", addr)
 	}
 
-	//recieving msgs
-	host.SetStreamHandler(protocolID, func(s network.Stream) {
-		fmt.Println("\nIncoming stream from:", s.Conn().RemotePeer())
+	host.SetStreamHandler(protocolID, handleStream)
 
-		reader := bufio.NewReader(s)
-		for {
-			msg, err := reader.ReadString('\n')
-			if err != nil {
-				return
-			}
-			fmt.Print("Peer: ", msg)
-		}
-	})
-
-	//manually connecting peer, doing coz theres a issue comming in mdns in my local machine, can skip this later on
-	fmt.Println("\nEnter peer multiaddress (or press Enter to skip):")
-
-	var input string
-	fmt.Scanln(&input)
-
-	if input != "" {
-		maddr, err := multiaddr.NewMultiaddr(input)
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		info, err := peer.AddrInfoFromP2pAddr(maddr)
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		err = host.Connect(ctx, *info)
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		fmt.Println("Connected to peer:", info.ID)
-	}
-
-	//send msg
-	go func() {
-		scanner := bufio.NewScanner(os.Stdin)
-		for scanner.Scan() {
-			text := scanner.Text()
-
-			for _, p := range host.Network().Peers() {
-				stream, err := host.NewStream(ctx, p, protocolID)
-				if err != nil {
-					continue
-				}
-
-				writer := bufio.NewWriter(stream)
-				writer.WriteString(text + "\n")
-				writer.Flush()
-			}
-		}
-	}()
-
-	//start mdns
 	err = setupMDNS(ctx, host)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	fmt.Println("mDNS service started")
+	fmt.Println("mDNS discovery started")
 
-	// Keep node alive
-	select {}
+	reader := bufio.NewReader(os.Stdin)
+
+	for {
+
+		fmt.Println("\nPress ENTER to record voice message")
+		reader.ReadString('\n')
+
+		audio := recordAudio()
+
+		for _, peer := range host.Network().Peers() {
+
+			stream, err := host.NewStream(ctx, peer, protocolID)
+			if err != nil {
+				continue
+			}
+
+			stream.Write(audio)
+			stream.Close()
+
+			fmt.Println("Voice message sent to", peer)
+		}
+	}
+}
+
+func handleStream(s network.Stream) {
+
+	fmt.Println("Receiving voice message")
+
+	data, err := io.ReadAll(s)
+	if err != nil {
+		return
+	}
+
+	playAudio(data)
+}
+
+func recordAudio() []byte {
+	portaudio.Initialize()
+	defer portaudio.Terminate()
+
+	sampleRate := 44100
+	seconds := 10
+	chunkSize := sampleRate 
+
+	
+	in := make([]int16, sampleRate*seconds)
+
+	chunk := make([]int16, chunkSize)
+
+
+	stream, err := portaudio.OpenDefaultStream(1, 0, float64(sampleRate), len(chunk), &chunk)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer stream.Close()
+
+	stream.Start()
+
+
+	fmt.Print("🔴 RECORDING NOW: ")
+
+
+	for i := 0; i < seconds; i++ {
+		err := stream.Read()
+		if err != nil {
+			log.Println("Error reading audio:", err)
+		}
+
+	
+		copy(in[i*chunkSize:], chunk)
+
+
+		fmt.Print(seconds-i, "... ")
+	}
+
+	stream.Stop()
+	fmt.Println("\n Done!")
+
+
+	buf := make([]byte, len(in)*2)
+	for i, v := range in {
+		binary.LittleEndian.PutUint16(buf[i*2:], uint16(v))
+	}
+
+	return buf
+}
+
+func playAudio(data []byte) {
+
+	portaudio.Initialize()
+	defer portaudio.Terminate()
+
+	out := make([]int16, len(data)/2)
+
+	for i := range out {
+		out[i] = int16(binary.LittleEndian.Uint16(data[i*2:]))
+	}
+
+	stream, err := portaudio.OpenDefaultStream(0, 1, 44100, 512, &out)
+	if err != nil {
+		log.Println(err)
+		return
+	}
+
+	stream.Start()
+	stream.Write()
+	stream.Stop()
 }
