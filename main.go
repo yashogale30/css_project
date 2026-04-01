@@ -1,150 +1,111 @@
 package main
 
 import (
-	"bufio"
+	
 	"context"
-	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
-	"os"
+	"net/http"
 
-	libp2p "github.com/libp2p/go-libp2p"
-	"github.com/gordonklaus/portaudio"
+	"github.com/gorilla/websocket"
+	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/network"
 )
 
-const protocolID = "/p2p-voice/1.0.0"
+const protocolID = "/p2p-chat/1.0.0"
+
+// ChatMessage represents both text and voice messages
+type ChatMessage struct {
+	Type    string `json:"type"`    // "text" or "audio"
+	Payload string `json:"payload"` // text content OR base64 audio data
+	Sender  string `json:"sender"`  // Peer ID
+}
+
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool { return true },
+}
+
+// Global channel to pass messages from libp2p to the WebSocket UI
+var uiMessages = make(chan ChatMessage, 10)
 
 func main() {
-
 	ctx := context.Background()
 
 	host, err := libp2p.New()
 	if err != nil {
 		log.Fatal(err)
 	}
+	defer host.Close()
 
-	fmt.Println("Peer ID:", host.ID())
+	fmt.Println("Your Peer ID:", host.ID())
 
-	for _, addr := range host.Addrs() {
-		fmt.Println("Listening on:", addr)
-	}
+	// Handle incoming p2p streams
+	host.SetStreamHandler(protocolID, func(s network.Stream) {
+		defer s.Close()
+		var msg ChatMessage
+		
+		// Read the JSON data sent from the peer
+		data, err := io.ReadAll(s)
+		if err != nil {
+			return
+		}
+		
+		if err := json.Unmarshal(data, &msg); err == nil {
+			// Send the received message to the UI channel
+			uiMessages <- msg
+		}
+	})
 
-	host.SetStreamHandler(protocolID, handleStream)
-
+	// Start mDNS (using your existing setupMDNS function)
 	err = setupMDNS(ctx, host)
 	if err != nil {
 		log.Fatal(err)
 	}
-
 	fmt.Println("mDNS discovery started")
 
-	reader := bufio.NewReader(os.Stdin)
-
-	for {
-
-		fmt.Println("\nPress ENTER to record voice message")
-		reader.ReadString('\n')
-
-		audio := recordAudio()
-
-		for _, peer := range host.Network().Peers() {
-
-			stream, err := host.NewStream(ctx, peer, protocolID)
-			if err != nil {
-				continue
-			}
-
-			stream.Write(audio)
-			stream.Close()
-
-			fmt.Println("Voice message sent to", peer)
-		}
-	}
-}
-
-func handleStream(s network.Stream) {
-
-	fmt.Println("Receiving voice message")
-
-	data, err := io.ReadAll(s)
-	if err != nil {
-		return
-	}
-
-	playAudio(data)
-}
-
-func recordAudio() []byte {
-	portaudio.Initialize()
-	defer portaudio.Terminate()
-
-	sampleRate := 44100
-	seconds := 10
-	chunkSize := sampleRate 
-
+	// Setup HTTP Server for UI and WebSocket
+	http.Handle("/", http.FileServer(http.Dir("./static")))
 	
-	in := make([]int16, sampleRate*seconds)
-
-	chunk := make([]int16, chunkSize)
-
-
-	stream, err := portaudio.OpenDefaultStream(1, 0, float64(sampleRate), len(chunk), &chunk)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer stream.Close()
-
-	stream.Start()
-
-
-	fmt.Print("🔴 RECORDING NOW: ")
-
-
-	for i := 0; i < seconds; i++ {
-		err := stream.Read()
+	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
-			log.Println("Error reading audio:", err)
+			log.Println("WebSocket upgrade failed:", err)
+			return
 		}
+		defer conn.Close()
 
-	
-		copy(in[i*chunkSize:], chunk)
+		// Goroutine to send messages FROM libp2p TO the UI
+		go func() {
+			for msg := range uiMessages {
+				conn.WriteJSON(msg)
+			}
+		}()
 
+		// Loop to read messages FROM the UI and send TO libp2p peers
+		for {
+			var msg ChatMessage
+			err := conn.ReadJSON(&msg)
+			if err != nil {
+				break
+			}
+			
+			msg.Sender = host.ID().String()
 
-		fmt.Print(seconds-i, "... ")
-	}
+			// Broadcast to all connected peers
+			msgBytes, _ := json.Marshal(msg)
+			for _, peerID := range host.Network().Peers() {
+				stream, err := host.NewStream(ctx, peerID, protocolID)
+				if err != nil {
+					continue
+				}
+				stream.Write(msgBytes)
+				stream.Close()
+			}
+		}
+	})
 
-	stream.Stop()
-	fmt.Println("\n Done!")
-
-
-	buf := make([]byte, len(in)*2)
-	for i, v := range in {
-		binary.LittleEndian.PutUint16(buf[i*2:], uint16(v))
-	}
-
-	return buf
-}
-
-func playAudio(data []byte) {
-
-	portaudio.Initialize()
-	defer portaudio.Terminate()
-
-	out := make([]int16, len(data)/2)
-
-	for i := range out {
-		out[i] = int16(binary.LittleEndian.Uint16(data[i*2:]))
-	}
-
-	stream, err := portaudio.OpenDefaultStream(0, 1, 44100, 512, &out)
-	if err != nil {
-		log.Println(err)
-		return
-	}
-
-	stream.Start()
-	stream.Write()
-	stream.Stop()
+	fmt.Println("Server running at http://localhost:8080")
+	log.Fatal(http.ListenAndServe(":8080", nil))
 }

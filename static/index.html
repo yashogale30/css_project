@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>P2P Voice & Text Chat</title>
+    <style>
+        body { font-family: sans-serif; background: #1e1e2e; color: #cdd6f4; margin: 0; display: flex; flex-direction: column; height: 100vh; }
+        #chat { flex: 1; padding: 20px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; }
+        .msg { background: #313244; padding: 10px 15px; border-radius: 8px; max-width: 70%; word-wrap: break-word; }
+        .msg.self { background: #89b4fa; color: #11111b; align-self: flex-end; }
+        .sender { font-size: 0.8em; opacity: 0.7; margin-bottom: 5px; display: block; }
+        #controls { display: flex; padding: 15px; background: #181825; gap: 10px; }
+        input[type="text"] { flex: 1; padding: 10px; border-radius: 5px; border: none; outline: none; background: #313244; color: #fff; }
+        button { padding: 10px 15px; border: none; border-radius: 5px; cursor: pointer; font-weight: bold; background: #89b4fa; color: #11111b; transition: 0.2s; }
+        button:hover { opacity: 0.8; }
+        #recordBtn { background: #f38ba8; }
+        #recordBtn.recording { animation: pulse 1s infinite alternate; }
+        @keyframes pulse { from { background: #f38ba8; } to { background: #ff476f; } }
+        audio { height: 35px; margin-top: 5px; outline: none; }
+    </style>
+</head>
+<body>
+
+    <div id="chat"></div>
+    
+    <div id="controls">
+        <input type="text" id="msgInput" placeholder="Type a message..." onkeypress="handleEnter(event)">
+        <button onclick="sendText()">Send</button>
+        <button id="recordBtn" onmousedown="startRecording()" onmouseup="stopRecording()">🎤 Hold to Record</button>
+    </div>
+
+    <script>
+        const ws = new WebSocket(`ws://${window.location.host}/ws`);
+        const chat = document.getElementById('chat');
+        const recordBtn = document.getElementById('recordBtn');
+        let mediaRecorder;
+        let audioChunks = [];
+
+        // Setup Audio Recording
+        navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
+            mediaRecorder = new MediaRecorder(stream);
+            
+            mediaRecorder.ondataavailable = event => {
+                audioChunks.push(event.data);
+            };
+
+            mediaRecorder.onstop = () => {
+            // REMOVED hardcoded { type: 'audio/webm' }
+            // Let the browser use its default recording format
+            const audioBlob = new Blob(audioChunks, { type: mediaRecorder.mimeType });
+            audioChunks = [];
+            
+            const reader = new FileReader();
+            reader.readAsDataURL(audioBlob);
+            reader.onloadend = () => {
+                const base64Audio = reader.result;
+                
+                // Debugging: Check if the string is generated correctly
+                console.log("Generated Audio URL:", base64Audio.substring(0, 50) + "...");
+                
+                sendMessage("audio", base64Audio);
+                appendMessage({ type: "audio", payload: base64Audio, sender: "You" }, true);
+            };
+        };
+        }).catch(err => console.error("Mic access denied:", err));
+
+        // WebSocket Handlers
+        ws.onmessage = (event) => {
+            const msg = JSON.parse(event.data);
+            appendMessage(msg, false);
+        };
+
+        // UI Interactions
+        function startRecording() {
+            if(mediaRecorder && mediaRecorder.state === "inactive") {
+                mediaRecorder.start();
+                recordBtn.classList.add("recording");
+                recordBtn.innerText = "Recording...";
+            }
+        }
+
+        function stopRecording() {
+            if(mediaRecorder && mediaRecorder.state === "recording") {
+                mediaRecorder.stop();
+                recordBtn.classList.remove("recording");
+                recordBtn.innerText = "🎤 Hold to Record";
+            }
+        }
+
+        function sendText() {
+            const input = document.getElementById('msgInput');
+            const text = input.value.trim();
+            if (text) {
+                sendMessage("text", text);
+                appendMessage({ type: "text", payload: text, sender: "You" }, true);
+                input.value = '';
+            }
+        }
+
+        function handleEnter(e) { if (e.key === 'Enter') sendText(); }
+
+        function sendMessage(type, payload) {
+            ws.send(JSON.stringify({ type: type, payload: payload }));
+        }
+
+        // Render messages to DOM
+        function appendMessage(msg, isSelf) {
+            const div = document.createElement('div');
+            div.className = `msg ${isSelf ? 'self' : ''}`;
+            
+            const senderSpan = `<span class="sender">${msg.sender.substring(0,8)}...</span>`;
+            
+            if (msg.type === "text") {
+                div.innerHTML = `${senderSpan}${msg.payload}`;
+            } else if (msg.type === "audio") {
+                div.innerHTML = `${senderSpan}<audio controls src="${msg.payload}"></audio>`;
+            }
+            
+            chat.appendChild(div);
+            chat.scrollTop = chat.scrollHeight; // Auto-scroll
+        }
+    </script>
+</body>
+</html>
